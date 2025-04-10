@@ -237,6 +237,170 @@ def run_model_cli():
 ```
 
 This code initializes the base model and then, if Medusa is enabled, wraps it with our `MedusaShardedModel` class. This is the entry point for the entire Medusa functionality.
+Based on the error logs and code implementation, I'll explain exactly which files in the Exo framework have been modified to integrate Medusa. Let me walk through each component with detailed explanations.
+
+# Medusa Integration in Exo Framework - Key Files
+
+## 1. MedusaShardedModel (Core Implementation)
+**File Location**: `exo/inference/torch/medusa/medusa_model.py`
+
+This is the primary implementation file that introduces Medusa functionality:
+
+```python
+class MedusaShardedModel(nn.Module):
+    def __init__(self, orig_model, num_heads=8, num_layers=1):
+        super().__init__()
+        self.orig_model = orig_model
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        # Initialize Medusa prediction heads
+        self.medusa_heads = nn.ModuleList([
+            nn.Linear(self.orig_model.config.hidden_size, self.orig_model.config.vocab_size)
+            for _ in range(num_heads * num_layers)
+        ])
+        print("After sharded_model creation..............")
+```
+
+This class is responsible for wrapping the original model and adding the Medusa prediction heads. These heads are designed to predict multiple future tokens simultaneously, which is the core concept of Medusa's speculative decoding approach.
+
+## 2. Inference Engine (Sampling Logic)
+**File Location**: `exo/inference/torch/sharded_inference_engine.py`
+
+This file has been modified to include Medusa sampling logic:
+
+```python
+def sample_token(self, logits, prev_tokens, inference_state):
+    try:
+        print("[Sample Debug] *** ATTEMPTING TO USE MEDUSA SAMPLING ***")
+        print(f"[Sample Debug] Medusa is enabled with {self.medusa_num_heads} heads")
+        
+        print("====== MEDUSA SAMPLING ACTIVE ======")
+        print(f"Using {self.medusa_num_heads} prediction heads for parallel decoding")
+        
+        # Critical check for Medusa cache availability
+        if not hasattr(self.sharded_model, 'medusa_cache') or self.sharded_model.medusa_cache is None:
+            print("Medusa cache not available, falling back to standard sampling")
+            # Standard token-by-token sampling fallback
+            # ...
+```
+
+The inference engine attempts to use Medusa for token sampling but falls back to standard sampling when the cache isn't available. The logs consistently show "Medusa cache not available, falling back to standard sampling" which indicates this part of the code is being executed.
+
+## 3. Cache Setup (Problem Area)
+**File Location**: `exo/inference/torch/sharded_inference_engine.py`
+
+The cache setup function has been modified to support Medusa, but it's encountering errors:
+
+```python
+def setup_cache(self, batch_size, max_seq_len):
+    # This line causes the 'ShardedGeneralModel' object has no attribute 'caches_are_enabled' error
+    if not self.sharded_model.model.caches_are_enabled() and self.use_cache:
+        print("Setting up caches...")
+        
+        # This causes parameter count mismatch errors
+        self.sharded_model.model.setup_caches(
+            batch_size,
+            torch.float16,  # dtype
+            max_seq_len
+        )
+        
+        # This is where Medusa cache initialization would happen
+        if hasattr(self.sharded_model, 'medusa_heads') and self.medusa_enabled:
+            self.sharded_model.medusa_cache = {
+                'key_values': None,
+                'predictions': []
+            }
+            print("Medusa cache initialized!")
+```
+
+This function attempts to set up the cache for Medusa, but it's failing with various errors like:
+- `'ShardedGeneralModel' object has no attribute 'caches_are_enabled'`
+- `ShardTransformerDecoder.setup_caches() takes 3 positional arguments but 4 were given`
+- `'ShardedGeneralModel' object has no attribute 'decoder_max_cache_seq_len'`
+
+## 4. ShardedGeneralModel (Modified for Medusa)
+**File Location**: `exo/inference/torch/models/general_mha.py`
+
+This file has been modified to support Medusa's cache requirements:
+
+```python
+def setup_caches(self, batch_size, dtype, decoder_max_seq_len):
+    # This is causing a parameter mismatch error
+    return self.model.setup_caches(batch_size, dtype, decoder_max_seq_len)
+```
+
+The error logs show that this function has compatibility issues with the ShardTransformerDecoder's setup_caches method.
+
+## 5. ShardTransformerDecoder (Cache Management)
+**File Location**: `exo/inference/torch/models/llm_utils.py`
+
+This file has been modified to support Medusa's specialized caching, but its parameter structure doesn't match what's being passed:
+
+```python
+def setup_caches(self, batch_size, max_seq_len):
+    # This function is expected to have 3 parameters, but is being called with 4
+    # ...
+```
+
+## 6. Main Entry Point for Medusa
+**File Location**: `exo/main.py`
+
+This file has been modified to initialize Medusa when the appropriate command-line flags are present:
+
+```python
+def run_model_cli():
+    args = parse_args()
+    
+    # Initialize the model as normal
+    model = initialize_model(args.model_name)
+    
+    # If Medusa is enabled, wrap the model with our MedusaShardedModel class
+    if args.medusa_enabled:
+        from exo.inference.torch.medusa.medusa_model import MedusaShardedModel
+        model = MedusaShardedModel(model, num_heads=args.medusa_num_heads, num_layers=args.medusa_num_layers)
+        print(f"Medusa enabled with {args.medusa_num_heads} heads and {args.medusa_num_layers} layers")
+```
+
+## 7. Run Script
+**File Location**: `run_exo_medusa.sh`
+
+This shell script provides a convenient interface for running Exo with Medusa enabled:
+
+```bash
+#!/bin/bash
+
+# Activate the virtual environment
+source $(dirname "$0")/exo-vanilla/Scripts/activate
+
+# Default model parameters
+MODEL="qwen-2.5-0.5b"
+PROMPT="Who are you?"
+MEDUSA_HEADS=8
+MEDUSA_LAYERS=1
+
+# Parse arguments
+# ...
+
+# Run exo with Medusa enabled
+python -m exo.main run "$MODEL" --prompt "$PROMPT" --medusa-enabled --medusa-num-heads "$MEDUSA_HEADS" --medusa-num-layers "$MEDUSA_LAYERS" --inference-engine torch
+```
+
+# Integration Issues and Analysis
+
+The error logs reveal several critical issues:
+
+1. **Cache Initialization Failure**: The most significant issue is that the Medusa cache is never properly initialized. The code attempts to check for `caches_are_enabled()` and set up caches, but these functions aren't compatible with the existing model structure.
+
+2. **Parameter Mismatches**: There are several parameter count mismatches, particularly in the `setup_caches()` method, where the code is passing 4 parameters but the function only accepts 3.
+
+3. **Missing Attributes**: The implementation tries to access attributes like `decoder_max_cache_seq_len` that don't exist on the model classes.
+
+4. **Forward Method Incompatibility**: The `generate` method in MedusaShardedModel attempts to call `self.orig_model.forward(tokens=tokens, **kwargs)`, but this results in a TypeError, suggesting that the original model's forward method doesn't accept these arguments.
+
+These issues collectively prevent Medusa from functioning properly, causing it to fall back to standard token-by-token generation rather than leveraging parallel decoding.
+
+The debug logs you shared consistently show that while Medusa is being correctly initialized with the specified number of heads, it's unable to utilize its parallel prediction capabilities due to these implementation challenges.
+
 
 ## Current Status and Error Logs
 
